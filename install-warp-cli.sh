@@ -12,6 +12,9 @@ plain='\033[0m'
 CLOUDFLARE_KEYRING="/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg"
 CLOUDFLARE_APT_LIST="/etc/apt/sources.list.d/cloudflare-client.list"
 CLOUDFLARE_RPM_REPO="/etc/yum.repos.d/cloudflare-warp.repo"
+WARP_UPDATE_SCRIPT="/usr/local/sbin/update-cloudflare-warp.sh"
+WARP_UPDATE_SERVICE="/etc/systemd/system/cloudflare-warp-update.service"
+WARP_UPDATE_TIMER="/etc/systemd/system/cloudflare-warp-update.timer"
 
 LOGD() {
     printf "%b[DBG] %s%b\n" "$yellow" "$*" "$plain"
@@ -75,6 +78,16 @@ warp_installed() {
     command -v warp-cli >/dev/null 2>&1
 }
 
+rpm_package_manager() {
+    if command -v dnf >/dev/null 2>&1; then
+        printf "dnf\n"
+    elif command -v yum >/dev/null 2>&1; then
+        printf "yum\n"
+    else
+        return 1
+    fi
+}
+
 is_supported_codename() {
     local codename=$1
     shift
@@ -114,37 +127,28 @@ add_apt_repo() {
     printf "deb [signed-by=%s] https://pkg.cloudflareclient.com/ %s main\n" "$CLOUDFLARE_KEYRING" "$codename" > "$CLOUDFLARE_APT_LIST"
 }
 
-install_apt_warp() {
+ensure_apt_warp_repository() {
     local distro_name=$1
     local codename=$2
 
-    LOGI "Installing for $distro_name ($codename)"
-
-    if warp_installed; then
-        die "warp-cli is already installed. Installation aborted."
-    fi
-
+    LOGI "Preparing Cloudflare WARP repository for $distro_name ($codename)"
     ensure_apt_prerequisites
     add_apt_repo "$codename"
     run "Updating apt repositories with Cloudflare WARP repo" apt-get update
-    run "Installing warp-cli" apt-get install -y cloudflare-warp netcat-openbsd
 }
 
-install_rpm_warp() {
+ensure_rpm_warp_repository() {
     local major_version
+    local pkg_manager
+
     major_version=$(rpm_major_version)
-
-    LOGI "Installing for $release $version_id"
-
-    if warp_installed; then
-        die "warp-cli is already installed. Installation aborted."
-    fi
-
     [[ "$major_version" == "8" ]] || incompatible_os
 
     require_command curl
     require_command rpm
-    require_command yum
+    pkg_manager=$(rpm_package_manager) || die "Required command is missing: dnf or yum"
+
+    LOGI "Preparing Cloudflare WARP repository for $release $version_id"
 
     # Cloudflare documents re-importing the package key for repositories that
     # had the old key installed before the 2025 key rotation.
@@ -152,27 +156,289 @@ install_rpm_warp() {
     run "Importing Cloudflare WARP RPM GPG key" rpm --import https://pkg.cloudflareclient.com/pubkey.gpg
     run "Adding Cloudflare WARP yum repository" bash -c \
         "curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo > '$CLOUDFLARE_RPM_REPO'"
-    run "Updating yum repositories" yum update -y
-    run "Installing warp-cli" yum install -y cloudflare-warp
+    run "Refreshing RPM package metadata" "$pkg_manager" makecache -y
 }
 
-detect_os_and_install_warp() {
+ensure_warp_repository() {
     case "$release" in
         ubuntu)
             is_supported_codename "$version_codename" focal jammy noble || incompatible_os
-            install_apt_warp "Ubuntu" "$version_codename"
+            ensure_apt_warp_repository "Ubuntu" "$version_codename"
             ;;
         debian)
             is_supported_codename "$version_codename" bullseye bookworm trixie || incompatible_os
-            install_apt_warp "Debian" "$version_codename"
+            ensure_apt_warp_repository "Debian" "$version_codename"
             ;;
         centos | rhel)
-            install_rpm_warp
+            ensure_rpm_warp_repository
             ;;
         *)
             incompatible_os
             ;;
     esac
+}
+
+install_latest_warp() {
+    if warp_installed; then
+        die "warp-cli is already installed. Installation aborted."
+    fi
+
+    ensure_warp_repository
+
+    case "$release" in
+        ubuntu | debian)
+            run "Installing latest warp-cli" apt-get install -y cloudflare-warp netcat-openbsd
+            ;;
+        centos | rhel)
+            local pkg_manager
+            pkg_manager=$(rpm_package_manager) || die "Required command is missing: dnf or yum"
+            run "Installing latest warp-cli" "$pkg_manager" install -y cloudflare-warp
+            ;;
+        *)
+            incompatible_os
+            ;;
+    esac
+
+    enable_monthly_warp_update
+}
+
+validate_warp_version() {
+    local version=$1
+
+    [[ -n "$version" ]] || die "Version cannot be empty."
+    [[ "$version" =~ ^[A-Za-z0-9.:_+~%-]+$ ]] || die "Version contains unsupported characters: $version"
+}
+
+prompt_warp_version() {
+    local version
+
+    list_available_warp_versions
+    read -r -p "Enter exact cloudflare-warp package version: " version
+    validate_warp_version "$version"
+    WARP_VERSION=$version
+}
+
+installed_warp_package_version() {
+    if command -v dpkg-query >/dev/null 2>&1 && dpkg-query -W -f='${Version}\n' cloudflare-warp >/dev/null 2>&1; then
+        dpkg-query -W -f='${Version}\n' cloudflare-warp
+    elif command -v rpm >/dev/null 2>&1 && rpm -q cloudflare-warp >/dev/null 2>&1; then
+        rpm -q --qf '%{VERSION}-%{RELEASE}\n' cloudflare-warp
+    else
+        return 1
+    fi
+}
+
+log_installed_warp_package_version() {
+    local installed_version
+
+    installed_version=$(installed_warp_package_version || true)
+    LOGI "Installed cloudflare-warp package version: ${installed_version:-unknown}"
+}
+
+list_available_warp_versions() {
+    ensure_warp_repository
+
+    LOGI "Available cloudflare-warp versions:"
+    case "$release" in
+        ubuntu | debian)
+            apt-cache madison cloudflare-warp || apt-cache policy cloudflare-warp
+            ;;
+        centos | rhel)
+            local pkg_manager
+            pkg_manager=$(rpm_package_manager) || die "Required command is missing: dnf or yum"
+            "$pkg_manager" --showduplicates list cloudflare-warp
+            ;;
+        *)
+            incompatible_os
+            ;;
+    esac
+}
+
+disable_monthly_warp_update() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        LOGE "systemctl is not available. Monthly auto-update cannot be disabled from this script."
+        return 0
+    fi
+
+    if [[ ! -f "$WARP_UPDATE_TIMER" ]]; then
+        LOGI "Monthly WARP auto-update timer is not installed."
+        return 0
+    fi
+
+    systemctl disable --now "$(basename "$WARP_UPDATE_TIMER")" >/dev/null 2>&1 || true
+    run "Reloading systemd units" systemctl daemon-reload
+    LOGI "Monthly WARP auto-update is disabled."
+}
+
+offer_disable_auto_update_for_fixed_version() {
+    local answer
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return
+    fi
+
+    if ! systemctl is-enabled --quiet "$(basename "$WARP_UPDATE_TIMER")" 2>/dev/null; then
+        return
+    fi
+
+    printf "%bMonthly WARP auto-update is enabled and can replace this fixed version with latest. Disable it? [Y/n]: %b" "$yellow" "$plain"
+    read -r answer
+
+    case "${answer:-Y}" in
+        [Yy] | [Yy][Ee][Ss])
+            disable_monthly_warp_update
+            ;;
+        *)
+            LOGD "Monthly auto-update remains enabled."
+            ;;
+    esac
+}
+
+install_warp_version() {
+    local version=$1
+
+    validate_warp_version "$version"
+
+    if warp_installed; then
+        die "warp-cli is already installed. Use rollback/update to switch versions."
+    fi
+
+    ensure_warp_repository
+
+    case "$release" in
+        ubuntu | debian)
+            run "Installing warp-cli version $version" apt-get install -y --allow-downgrades "cloudflare-warp=$version" netcat-openbsd
+            ;;
+        centos | rhel)
+            local pkg_manager
+            pkg_manager=$(rpm_package_manager) || die "Required command is missing: dnf or yum"
+            run "Installing warp-cli version $version" "$pkg_manager" install -y "cloudflare-warp-$version"
+            ;;
+        *)
+            incompatible_os
+            ;;
+    esac
+
+    offer_disable_auto_update_for_fixed_version
+    log_installed_warp_package_version
+}
+
+switch_rpm_warp_version() {
+    local pkg_manager=$1
+    local version=$2
+
+    if "$pkg_manager" downgrade -y "cloudflare-warp-$version"; then
+        return 0
+    fi
+
+    LOGD "RPM downgrade did not apply; trying exact-version install."
+    "$pkg_manager" install -y "cloudflare-warp-$version"
+}
+
+switch_warp_version() {
+    local version=$1
+
+    validate_warp_version "$version"
+    warp_installed || die "warp-cli is not installed. Rollback/update aborted."
+
+    ensure_warp_repository
+
+    case "$release" in
+        ubuntu | debian)
+            run "Installing requested warp-cli version $version" apt-get install -y --allow-downgrades "cloudflare-warp=$version"
+            ;;
+        centos | rhel)
+            local pkg_manager
+            pkg_manager=$(rpm_package_manager) || die "Required command is missing: dnf or yum"
+            run "Rolling back/updating warp-cli to version $version" switch_rpm_warp_version "$pkg_manager" "$version"
+            ;;
+        *)
+            incompatible_os
+            ;;
+    esac
+
+    offer_disable_auto_update_for_fixed_version
+    log_installed_warp_package_version
+}
+
+detect_os_and_install_warp() {
+    install_latest_warp
+}
+
+enable_monthly_warp_update() {
+    local required=${1:-false}
+
+    if ! warp_installed; then
+        if [[ "$required" == "true" ]]; then
+            die "warp-cli is not installed. Monthly auto-update setup aborted."
+        fi
+        LOGE "warp-cli is not installed. Monthly auto-update was not configured."
+        return 0
+    fi
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        if [[ "$required" == "true" ]]; then
+            die "systemctl is not available. Monthly auto-update setup aborted."
+        fi
+        LOGE "systemctl is not available. Monthly auto-update was not configured."
+        return 0
+    fi
+
+    install -d -m 0755 /usr/local/sbin /etc/systemd/system
+
+    cat > "$WARP_UPDATE_SCRIPT" <<'UPDATE_SCRIPT'
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+if ! command -v warp-cli >/dev/null 2>&1; then
+    echo "warp-cli is not installed; nothing to update."
+    exit 0
+fi
+
+if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --only-upgrade cloudflare-warp
+elif command -v dnf >/dev/null 2>&1; then
+    dnf update -y cloudflare-warp
+elif command -v yum >/dev/null 2>&1; then
+    yum update -y cloudflare-warp
+else
+    echo "No supported package manager found for Cloudflare WARP updates." >&2
+    exit 1
+fi
+UPDATE_SCRIPT
+    chmod 0755 "$WARP_UPDATE_SCRIPT"
+
+    cat > "$WARP_UPDATE_SERVICE" <<EOF
+[Unit]
+Description=Update Cloudflare WARP package
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$WARP_UPDATE_SCRIPT
+EOF
+
+    cat > "$WARP_UPDATE_TIMER" <<EOF
+[Unit]
+Description=Run monthly Cloudflare WARP package update
+
+[Timer]
+OnCalendar=monthly
+Persistent=true
+RandomizedDelaySec=1h
+Unit=$(basename "$WARP_UPDATE_SERVICE")
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    run "Reloading systemd units" systemctl daemon-reload
+    run "Enabling monthly WARP auto-update timer" systemctl enable --now "$(basename "$WARP_UPDATE_TIMER")"
+    LOGI "Monthly WARP auto-update is enabled via $(basename "$WARP_UPDATE_TIMER")."
 }
 
 port_is_available() {
@@ -299,9 +565,15 @@ print_menu() {
 
     LOGI "Functions:"
     echo "0. Exit"
-    echo "1. Install and configure warp-cli"
-    echo "2. Install warp-cli without configuring"
-    echo "3. Configure warp-cli (only if it is already installed)"
+    echo "1. Install latest warp-cli and configure"
+    echo "2. Install latest warp-cli without configuring"
+    echo "3. Install specific warp-cli version and configure"
+    echo "4. Install specific warp-cli version without configuring"
+    echo "5. Configure warp-cli (only if it is already installed)"
+    echo "6. Roll back/update warp-cli to a specific version"
+    echo "7. List available warp-cli package versions"
+    echo "8. Enable monthly warp-cli auto-update"
+    echo "9. Disable monthly warp-cli auto-update"
 }
 
 manage_warp() {
@@ -309,7 +581,7 @@ manage_warp() {
 
     while true; do
         print_menu
-        read -r -p "Select action (0-3): " choice
+        read -r -p "Select action (0-9): " choice
 
         case "${choice:-}" in
             0)
@@ -325,7 +597,35 @@ manage_warp() {
                 return
                 ;;
             3)
+                prompt_warp_version
+                install_warp_version "$WARP_VERSION"
                 configure_warp
+                return
+                ;;
+            4)
+                prompt_warp_version
+                install_warp_version "$WARP_VERSION"
+                return
+                ;;
+            5)
+                configure_warp
+                return
+                ;;
+            6)
+                prompt_warp_version
+                switch_warp_version "$WARP_VERSION"
+                return
+                ;;
+            7)
+                list_available_warp_versions
+                return
+                ;;
+            8)
+                enable_monthly_warp_update true
+                return
+                ;;
+            9)
+                disable_monthly_warp_update
                 return
                 ;;
             *)
