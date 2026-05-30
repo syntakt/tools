@@ -15,6 +15,7 @@ CLOUDFLARE_RPM_REPO="/etc/yum.repos.d/cloudflare-warp.repo"
 WARP_UPDATE_SCRIPT="/usr/local/sbin/update-cloudflare-warp.sh"
 WARP_UPDATE_SERVICE="/etc/systemd/system/cloudflare-warp-update.service"
 WARP_UPDATE_TIMER="/etc/systemd/system/cloudflare-warp-update.timer"
+WARP_PROXY_HOST="127.0.0.1"
 
 LOGD() {
     printf "%b[DBG] %s%b\n" "$yellow" "$*" "$plain"
@@ -115,7 +116,7 @@ incompatible_os() {
 
 ensure_apt_prerequisites() {
     run "Updating apt repositories" apt-get update
-    run "Installing apt prerequisites" apt-get install -y ca-certificates curl gpg
+    run "Installing apt prerequisites" apt-get install -y ca-certificates curl gpg iproute2
 }
 
 add_apt_repo() {
@@ -460,6 +461,60 @@ port_is_available() {
     fi
 }
 
+local_proxy_listeners() {
+    local port=$1
+
+    require_command ss
+    ss -H -ltn "sport = :$port"
+}
+
+verify_local_proxy_listener() {
+    local port=$1
+    local listeners
+    local line
+    local local_address
+    local non_local_listeners=()
+    local found_ipv4_loopback=false
+
+    for _ in {1..10}; do
+        listeners=$(local_proxy_listeners "$port" || true)
+        [[ -n "$listeners" ]] && break
+        sleep 1
+    done
+
+    if [[ -z "$listeners" ]]; then
+        die "WARP local proxy did not start listening on ${WARP_PROXY_HOST}:$port."
+    fi
+
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        local_address=$(awk '{print $4}' <<< "$line")
+
+        case "$local_address" in
+            "${WARP_PROXY_HOST}:$port")
+                found_ipv4_loopback=true
+                ;;
+            "[::1]:$port" | "::1:$port")
+                ;;
+            *)
+                non_local_listeners+=("$local_address")
+                ;;
+        esac
+    done <<< "$listeners"
+
+    if ((${#non_local_listeners[@]} > 0)); then
+        LOGE "WARP proxy must be local-only, but these listeners were found:"
+        printf "%s\n" "${non_local_listeners[@]}" >&2
+        die "Refusing to continue because WARP proxy is not limited to ${WARP_PROXY_HOST}:$port."
+    fi
+
+    if [[ "$found_ipv4_loopback" != "true" ]]; then
+        die "WARP proxy is not listening on required local address ${WARP_PROXY_HOST}:$port."
+    fi
+
+    LOGI "Verified WARP local proxy is bound to ${WARP_PROXY_HOST}:$port only."
+}
+
 select_port() {
     local port
 
@@ -558,8 +613,10 @@ configure_warp() {
     run "Starting WARP" warp-cli --accept-tos connect
 
     LOGI "warp-cli has been configured successfully."
-    LOGI "You can access the local proxy on 127.0.0.1:$WARP_PORT."
-    LOGD "Check it with: curl -x socks5://127.0.0.1:$WARP_PORT https://www.cloudflare.com/cdn-cgi/trace"
+    verify_local_proxy_listener "$WARP_PORT"
+
+    LOGI "You can access the local proxy on ${WARP_PROXY_HOST}:$WARP_PORT."
+    LOGD "Check it with: curl -x socks5://${WARP_PROXY_HOST}:$WARP_PORT https://www.cloudflare.com/cdn-cgi/trace"
     LOGD "The trace output should include: warp=on"
     LOGE "You do not need to open port $WARP_PORT on the firewall."
 }
