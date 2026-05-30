@@ -119,12 +119,16 @@ ensure_apt_prerequisites() {
     run "Installing apt prerequisites" apt-get install -y ca-certificates curl gpg iproute2
 }
 
+download_cloudflare_apt_key() {
+    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+        | gpg --yes --dearmor --output "$CLOUDFLARE_KEYRING"
+}
+
 add_apt_repo() {
     local codename=$1
 
     install -d -m 0755 /usr/share/keyrings
-    run "Adding Cloudflare WARP GPG key" bash -c \
-        "curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output '$CLOUDFLARE_KEYRING'"
+    run "Adding Cloudflare WARP GPG key" download_cloudflare_apt_key
     printf "deb [signed-by=%s] https://pkg.cloudflareclient.com/ %s main\n" "$CLOUDFLARE_KEYRING" "$codename" > "$CLOUDFLARE_APT_LIST"
 }
 
@@ -138,6 +142,16 @@ ensure_apt_warp_repository() {
     run "Updating apt repositories with Cloudflare WARP repo" apt-get update
 }
 
+ensure_rpm_prerequisites() {
+    local pkg_manager=$1
+
+    run "Installing RPM prerequisites" "$pkg_manager" install -y ca-certificates curl iproute
+}
+
+download_cloudflare_rpm_repo() {
+    curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo > "$CLOUDFLARE_RPM_REPO"
+}
+
 ensure_rpm_warp_repository() {
     local major_version
     local pkg_manager
@@ -145,18 +159,17 @@ ensure_rpm_warp_repository() {
     major_version=$(rpm_major_version)
     [[ "$major_version" == "8" ]] || incompatible_os
 
-    require_command curl
     require_command rpm
     pkg_manager=$(rpm_package_manager) || die "Required command is missing: dnf or yum"
 
     LOGI "Preparing Cloudflare WARP repository for $release $version_id"
+    ensure_rpm_prerequisites "$pkg_manager"
 
     # Cloudflare documents re-importing the package key for repositories that
     # had the old key installed before the 2025 key rotation.
     rpm -e 'gpg-pubkey(4fa1c3ba-61abda35)' >/dev/null 2>&1 || true
     run "Importing Cloudflare WARP RPM GPG key" rpm --import https://pkg.cloudflareclient.com/pubkey.gpg
-    run "Adding Cloudflare WARP yum repository" bash -c \
-        "curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo > '$CLOUDFLARE_RPM_REPO'"
+    run "Adding Cloudflare WARP yum repository" download_cloudflare_rpm_repo
     run "Refreshing RPM package metadata" "$pkg_manager" makecache -y
 }
 
@@ -266,7 +279,7 @@ disable_monthly_warp_update() {
         return 0
     fi
 
-    systemctl disable --now "$(basename "$WARP_UPDATE_TIMER")" >/dev/null 2>&1 || true
+    run "Disabling monthly WARP auto-update timer" systemctl disable --now "$(basename "$WARP_UPDATE_TIMER")"
     run "Reloading systemd units" systemctl daemon-reload
     LOGI "Monthly WARP auto-update is disabled."
 }
@@ -595,8 +608,17 @@ set_warp_proxy_port() {
     warp-cli --accept-tos set-proxy-port "$port"
 }
 
+set_masque_tunnel_protocol() {
+    if warp-cli --accept-tos tunnel protocol set MASQUE; then
+        return
+    fi
+
+    LOGD "Could not set MASQUE tunnel protocol; continuing with current tunnel protocol."
+}
+
 configure_warp() {
     warp_installed || die "warp-cli is not installed. Configuring aborted."
+    require_command ss
 
     LOGI "Configuring WARP"
 
@@ -608,17 +630,18 @@ configure_warp() {
     configure_license_if_requested
     select_port
 
+    run "Setting MASQUE tunnel protocol for local proxy mode" set_masque_tunnel_protocol
     run "Setting local proxy mode" set_warp_proxy_mode
     run "Setting local proxy port to $WARP_PORT" set_warp_proxy_port "$WARP_PORT"
     run "Starting WARP" warp-cli --accept-tos connect
 
-    LOGI "warp-cli has been configured successfully."
     verify_local_proxy_listener "$WARP_PORT"
 
+    LOGI "warp-cli has been configured successfully."
     LOGI "You can access the local proxy on ${WARP_PROXY_HOST}:$WARP_PORT."
     LOGD "Check it with: curl -x socks5://${WARP_PROXY_HOST}:$WARP_PORT https://www.cloudflare.com/cdn-cgi/trace"
     LOGD "The trace output should include: warp=on"
-    LOGE "You do not need to open port $WARP_PORT on the firewall."
+    LOGI "Do not open port $WARP_PORT on the firewall."
 }
 
 print_menu() {
