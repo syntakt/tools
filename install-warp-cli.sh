@@ -488,7 +488,13 @@ warp_connected() {
 }
 
 warp_registered() {
-    warp-cli --accept-tos registration show >/dev/null 2>&1
+    local registration_output
+
+    if ! registration_output=$(warp-cli --accept-tos registration show 2>&1); then
+        return 1
+    fi
+
+    ! printf "%s\n" "$registration_output" | grep -Eqi 'missing registration|registration missing|no registration'
 }
 
 register_warp_if_needed() {
