@@ -89,29 +89,83 @@ rpm_package_manager() {
     fi
 }
 
-is_supported_codename() {
-    local codename=$1
-    shift
-    local supported
-
-    for supported in "$@"; do
-        [[ "$codename" == "$supported" ]] && return 0
-    done
-
-    return 1
-}
-
 rpm_major_version() {
     printf "%s\n" "$version_id" | cut -d. -f1
 }
 
 incompatible_os() {
     printf "%bYour operating system is not supported by this script.%b\n\n" "$red" "$plain"
-    echo "Supported Cloudflare WARP package targets:"
-    echo "- Ubuntu: focal (20.04), jammy (22.04), noble (24.04)"
+    echo "Supported operating systems:"
+    echo "- Ubuntu: focal (20.04), jammy (22.04), noble (24.04), resolute (26.04)"
     echo "- Debian: bullseye (11), bookworm (12), trixie (13)"
     echo "- Red Hat Enterprise Linux / CentOS: 8"
+    echo
+    echo "Cloudflare WARP apt package targets:"
+    echo "- Ubuntu: focal, jammy, noble (Ubuntu 26.04 uses noble until Cloudflare publishes resolute packages)"
+    echo "- Debian: bullseye, bookworm, trixie"
     exit 1
+}
+
+cloudflare_apt_target_codename() {
+    local distro=$1
+    local codename=$2
+    local version=$3
+
+    case "$distro" in
+        ubuntu)
+            case "$codename" in
+                focal | jammy | noble)
+                    printf "%s\n" "$codename"
+                    return 0
+                    ;;
+                resolute)
+                    printf "noble\n"
+                    return 0
+                    ;;
+            esac
+
+            case "$version" in
+                20.04)
+                    printf "focal\n"
+                    ;;
+                22.04)
+                    printf "jammy\n"
+                    ;;
+                24.04 | 26.04)
+                    printf "noble\n"
+                    ;;
+                *)
+                    return 1
+                    ;;
+            esac
+            ;;
+        debian)
+            case "$codename" in
+                bullseye | bookworm | trixie)
+                    printf "%s\n" "$codename"
+                    return 0
+                    ;;
+            esac
+
+            case "$version" in
+                11)
+                    printf "bullseye\n"
+                    ;;
+                12)
+                    printf "bookworm\n"
+                    ;;
+                13)
+                    printf "trixie\n"
+                    ;;
+                *)
+                    return 1
+                    ;;
+            esac
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
 ensure_apt_prerequisites() {
@@ -134,11 +188,15 @@ add_apt_repo() {
 
 ensure_apt_warp_repository() {
     local distro_name=$1
-    local codename=$2
+    local os_codename=$2
+    local package_codename=$3
 
-    LOGI "Preparing Cloudflare WARP repository for $distro_name ($codename)"
+    LOGI "Preparing Cloudflare WARP repository for $distro_name ($os_codename)"
+    if [[ "$os_codename" != "$package_codename" ]]; then
+        LOGI "Using Cloudflare WARP package target: $package_codename"
+    fi
     ensure_apt_prerequisites
-    add_apt_repo "$codename"
+    add_apt_repo "$package_codename"
     run "Updating apt repositories with Cloudflare WARP repo" apt-get update
 }
 
@@ -174,14 +232,16 @@ ensure_rpm_warp_repository() {
 }
 
 ensure_warp_repository() {
+    local package_codename
+
     case "$release" in
         ubuntu)
-            is_supported_codename "$version_codename" focal jammy noble || incompatible_os
-            ensure_apt_warp_repository "Ubuntu" "$version_codename"
+            package_codename=$(cloudflare_apt_target_codename "$release" "$version_codename" "$version_id") || incompatible_os
+            ensure_apt_warp_repository "Ubuntu" "$version_codename" "$package_codename"
             ;;
         debian)
-            is_supported_codename "$version_codename" bullseye bookworm trixie || incompatible_os
-            ensure_apt_warp_repository "Debian" "$version_codename"
+            package_codename=$(cloudflare_apt_target_codename "$release" "$version_codename" "$version_id") || incompatible_os
+            ensure_apt_warp_repository "Debian" "$version_codename" "$package_codename"
             ;;
         centos | rhel)
             ensure_rpm_warp_repository
