@@ -176,12 +176,17 @@ ensure_apt_prerequisites() {
 remove_existing_cloudflare_apt_repo() {
     local source_file
 
-    for source_file in "$CLOUDFLARE_APT_LIST" /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+    for source_file in /etc/apt/sources.list "$CLOUDFLARE_APT_LIST" /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
         [[ -f "$source_file" ]] || continue
         grep -qs 'pkg.cloudflareclient.com' "$source_file" || continue
 
-        LOGD "Removing stale Cloudflare WARP apt source: $source_file"
-        rm -f "$source_file"
+        if [[ "$source_file" == "/etc/apt/sources.list" ]]; then
+            LOGD "Removing stale Cloudflare WARP apt source lines from: $source_file"
+            sed -i.bak '/pkg\.cloudflareclient\.com/d' "$source_file"
+        else
+            LOGD "Removing stale Cloudflare WARP apt source: $source_file"
+            rm -f "$source_file"
+        fi
     done
 }
 
