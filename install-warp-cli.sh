@@ -173,6 +173,12 @@ ensure_apt_prerequisites() {
     run "Installing apt prerequisites" apt-get install -y ca-certificates curl gpg iproute2
 }
 
+remove_existing_cloudflare_apt_repo() {
+    if [[ -f "$CLOUDFLARE_APT_LIST" ]]; then
+        rm -f "$CLOUDFLARE_APT_LIST"
+    fi
+}
+
 download_cloudflare_apt_key() {
     curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
         | gpg --yes --dearmor --output "$CLOUDFLARE_KEYRING"
@@ -195,6 +201,7 @@ ensure_apt_warp_repository() {
     if [[ "$os_codename" != "$package_codename" ]]; then
         LOGI "Using Cloudflare WARP package target: $package_codename"
     fi
+    run "Removing existing Cloudflare WARP apt repository" remove_existing_cloudflare_apt_repo
     ensure_apt_prerequisites
     add_apt_repo "$package_codename"
     run "Updating apt repositories with Cloudflare WARP repo" apt-get update
