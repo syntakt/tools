@@ -174,9 +174,15 @@ ensure_apt_prerequisites() {
 }
 
 remove_existing_cloudflare_apt_repo() {
-    if [[ -f "$CLOUDFLARE_APT_LIST" ]]; then
-        rm -f "$CLOUDFLARE_APT_LIST"
-    fi
+    local source_file
+
+    for source_file in "$CLOUDFLARE_APT_LIST" /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+        [[ -f "$source_file" ]] || continue
+        grep -qs 'pkg.cloudflareclient.com' "$source_file" || continue
+
+        LOGD "Removing stale Cloudflare WARP apt source: $source_file"
+        rm -f "$source_file"
+    done
 }
 
 download_cloudflare_apt_key() {
@@ -201,7 +207,7 @@ ensure_apt_warp_repository() {
     if [[ "$os_codename" != "$package_codename" ]]; then
         LOGI "Using Cloudflare WARP package target: $package_codename"
     fi
-    run "Removing existing Cloudflare WARP apt repository" remove_existing_cloudflare_apt_repo
+    run "Removing existing Cloudflare WARP apt repositories" remove_existing_cloudflare_apt_repo
     ensure_apt_prerequisites
     add_apt_repo "$package_codename"
     run "Updating apt repositories with Cloudflare WARP repo" apt-get update
